@@ -1,8 +1,9 @@
-import { ICodec, ICommunicationManager, IConnection, IConnectionStateListener, IMessageComposer, IMessageConfiguration, IMessageDataWrapper, IMessageEvent, NitroLogger, WebSocketEventEnum } from '../../api';
+import { ICodec, ICommunicationManager, IConnection, IConnectionStateListener, IMessageComposer, IMessageConfiguration, IMessageDataWrapper, IMessageEvent, NitroConfiguration, NitroLogger, WebSocketEventEnum } from '../../api';
 import { SocketConnectionEvent } from '../../events';
 import { EventDispatcher } from '../common';
 import { EvaWireFormat } from './codec';
 import { MessageClassManager } from './messages';
+import { PacketEncryption } from './PacketEncryption';
 
 export class SocketConnection extends EventDispatcher implements IConnection
 {
@@ -18,6 +19,8 @@ export class SocketConnection extends EventDispatcher implements IConnection
     private _pendingServerMessages: IMessageDataWrapper[];
 
     private _isAuthenticated: boolean;
+    private _encryption: PacketEncryption | null;
+    private _handshakeComplete: boolean;
 
     constructor(communicationManager: ICommunicationManager, stateListener: IConnectionStateListener)
     {
@@ -35,6 +38,8 @@ export class SocketConnection extends EventDispatcher implements IConnection
         this._pendingServerMessages = [];
 
         this._isAuthenticated = false;
+        this._encryption = null;
+        this._handshakeComplete = false;
 
         this.onOpen = this.onOpen.bind(this);
         this.onClose = this.onClose.bind(this);
@@ -58,11 +63,122 @@ export class SocketConnection extends EventDispatcher implements IConnection
 
         this.destroySocket();
 
+        if(this._encryption)
+        {
+            this._encryption.dispose();
+            this._encryption = null;
+        }
+
         this._communicationManager = null;
         this._stateListener = null;
         this._messages = null;
         this._codec = null;
         this._dataBuffer = null;
+    }
+
+    /**
+     * Performs encryption handshake with server:
+     * 1. Receive server's public key (4-byte length + public key)
+     * 2. Send client's public key (4-byte length + public key)
+     * 3. Derive shared secret and initialize encryption
+     */
+    private async performEncryptionHandshake(): Promise<void>
+    {
+        try
+        {
+            // Initialize encryption
+            this._encryption = new PacketEncryption();
+            await this._encryption.initialize();
+
+            // Wait for server's public key (first message)
+            const serverPublicKeyData = await this.waitForHandshakeMessage();
+            
+            NitroLogger.log('[Encryption] Received server public key (' + serverPublicKeyData.byteLength + ' bytes)');
+
+            // Send client's public key
+            const clientPublicKey = await this._encryption.getPublicKey();
+            
+            console.log('[Encryption DEBUG] Client public key length:', clientPublicKey.byteLength);
+            console.log('[Encryption DEBUG] Client public key (first 16 bytes):', 
+                Array.from(new Uint8Array(clientPublicKey).slice(0, 16))
+                    .map(b => b.toString(16).padStart(2, '0').toUpperCase())
+                    .join(' '));
+            
+            const sendBuffer = new ArrayBuffer(4 + clientPublicKey.byteLength);
+            const sendView = new DataView(sendBuffer);
+            
+            // Write length prefix (big-endian)
+            sendView.setUint32(0, clientPublicKey.byteLength, false);
+            
+            console.log('[Encryption DEBUG] Length prefix written:', sendView.getUint32(0, false));
+            
+            // Copy public key
+            new Uint8Array(sendBuffer, 4).set(new Uint8Array(clientPublicKey));
+            
+            console.log('[Encryption DEBUG] Total buffer size to send:', sendBuffer.byteLength);
+            
+            this._socket.send(sendBuffer);
+            NitroLogger.log('[Encryption] Sent client public key (' + clientPublicKey.byteLength + ' bytes)');
+
+            // Complete key exchange
+            await this._encryption.completeKeyExchange(serverPublicKeyData);
+            
+            this._handshakeComplete = true;
+        }
+        catch(error)
+        {
+            throw new Error('Encryption handshake failed: ' + error);
+        }
+    }
+
+    /**
+     * Waits for and processes a single handshake message
+     */
+    private waitForHandshakeMessage(): Promise<ArrayBuffer>
+    {
+        return new Promise((resolve, reject) =>
+        {
+            const timeout = setTimeout(() =>
+            {
+                this._socket.removeEventListener('message', messageHandler);
+                reject(new Error('Handshake timeout'));
+            }, 10000); // 10 second timeout
+
+            const messageHandler = (event: MessageEvent) =>
+            {
+                clearTimeout(timeout);
+                this._socket.removeEventListener('message', messageHandler);
+
+                const reader = new FileReader();
+                reader.readAsArrayBuffer(event.data);
+                reader.onloadend = () =>
+                {
+                    const data = reader.result as ArrayBuffer;
+                    
+                    if(data.byteLength < 4)
+                    {
+                        reject(new Error('Invalid handshake message'));
+                        return;
+                    }
+
+                    // Read length prefix
+                    const view = new DataView(data);
+                    const length = view.getUint32(0, false); // big-endian
+                    
+                    if(data.byteLength < 4 + length)
+                    {
+                        reject(new Error('Incomplete handshake message'));
+                        return;
+                    }
+
+                    // Extract public key
+                    const publicKey = data.slice(4, 4 + length);
+                    resolve(publicKey);
+                };
+            };
+
+            this._socket.addEventListener('message', messageHandler);
+        });
     }
 
     public onReady(): void
@@ -110,7 +226,39 @@ export class SocketConnection extends EventDispatcher implements IConnection
 
     private onOpen(event: Event): void
     {
-        this.dispatchConnectionEvent(SocketConnectionEvent.CONNECTION_OPENED, event);
+        // Check if encryption is enabled in config
+        const encryptionEnabled = NitroConfiguration.getValue<boolean>('packet.encryption.enabled', false);
+        
+        if(encryptionEnabled)
+        {
+            // Check if in secure context (required for Web Crypto API)
+            if(!window.isSecureContext)
+            {
+                NitroLogger.error('[Encryption] Not in secure context. Encryption requires HTTPS or localhost!');
+                NitroLogger.error('[Encryption] Current URL:', window.location.href);
+                NitroLogger.error('[Encryption] Falling back to unencrypted connection (bypassed)...');
+                this._handshakeComplete = true; // Skip encryption
+                this.dispatchConnectionEvent(SocketConnectionEvent.CONNECTION_OPENED, event);
+                return;
+            }
+
+            // Start encryption handshake when connection opens
+            this.performEncryptionHandshake().then(() =>
+            {
+                NitroLogger.log('[Encryption] ✅ Handshake completed - All packets are now ENCRYPTED with AES-256-GCM');
+                this.dispatchConnectionEvent(SocketConnectionEvent.CONNECTION_OPENED, event);
+            }).catch((error) =>
+            {
+                NitroLogger.error('[Encryption] Handshake failed:', error);
+                this._socket?.close();
+            });
+        }
+        else
+        {
+            NitroLogger.log('[Encryption] Packet encryption is DISABLED - connection is NOT encrypted (bypassed)');
+            this._handshakeComplete = true; // Skip encryption
+            this.dispatchConnectionEvent(SocketConnectionEvent.CONNECTION_OPENED, event);
+        }
     }
 
     private onClose(event: CloseEvent): void
@@ -127,15 +275,29 @@ export class SocketConnection extends EventDispatcher implements IConnection
     {
         if(!event) return;
 
-        //this.dispatchConnectionEvent(SocketConnectionEvent.CONNECTION_MESSAGE, event);
-
         const reader = new FileReader();
 
         reader.readAsArrayBuffer(event.data);
 
-        reader.onloadend = () =>
+        reader.onloadend = async () =>
         {
-            this._dataBuffer = this.concatArrayBuffers(this._dataBuffer, (reader.result as ArrayBuffer));
+            let receivedData = reader.result as ArrayBuffer;
+
+            // If handshake is complete and encryption is initialized, decrypt the data
+            if(this._handshakeComplete && this._encryption && this._encryption.isInitialized)
+            {
+                try
+                {
+                    receivedData = await this._encryption.decrypt(receivedData);
+                }
+                catch(error)
+                {
+                    NitroLogger.error('[Encryption] Failed to decrypt packet:', error);
+                    return;
+                }
+            }
+
+            this._dataBuffer = this.concatArrayBuffers(this._dataBuffer, receivedData);
 
             this.processReceivedData();
         };
@@ -197,9 +359,23 @@ export class SocketConnection extends EventDispatcher implements IConnection
         return true;
     }
 
-    private write(buffer: ArrayBuffer): void
+    private async write(buffer: ArrayBuffer): Promise<void>
     {
         if(this._socket.readyState !== WebSocket.OPEN) return;
+
+        // If handshake is complete and encryption is initialized, encrypt the data
+        if(this._handshakeComplete && this._encryption && this._encryption.isInitialized)
+        {
+            try
+            {
+                buffer = await this._encryption.encrypt(buffer);
+            }
+            catch(error)
+            {
+                NitroLogger.error('[Encryption] Failed to encrypt packet:', error);
+                return;
+            }
+        }
 
         this._socket.send(buffer);
     }
