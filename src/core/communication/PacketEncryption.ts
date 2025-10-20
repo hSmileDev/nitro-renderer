@@ -74,7 +74,7 @@ export class PacketEncryption
                 []
             );
 
-            // Derive AES key from shared secret using ECDH + HKDF
+            // Derive AES key from shared secret using ECDH
             this._aesKey = await window.crypto.subtle.deriveKey(
                 {
                     name: 'ECDH',
@@ -85,22 +85,9 @@ export class PacketEncryption
                     name: 'AES-GCM',
                     length: PacketEncryption.AES_KEY_SIZE
                 },
-                true, // Make extractable temporarily for debugging
+                false, // Not extractable for security
                 ['encrypt', 'decrypt']
             );
-
-            // Debug: Export and log the derived key
-            try
-            {
-                const exportedKey = await window.crypto.subtle.exportKey('raw', this._aesKey);
-                const keyBytes = new Uint8Array(exportedKey);
-                console.log('[ECDH] AES key length:', keyBytes.length);
-                console.log('[ECDH] AES key (first 8 bytes):', Array.from(keyBytes.slice(0, 8)).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join('-'));
-            }
-            catch (e)
-            {
-                console.log('[ECDH] Could not export key for debugging:', e);
-            }
 
             this._isInitialized = true;
             this._nonceCounter = 0;

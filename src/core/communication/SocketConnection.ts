@@ -97,25 +97,14 @@ export class SocketConnection extends EventDispatcher implements IConnection
 
             // Send client's public key
             const clientPublicKey = await this._encryption.getPublicKey();
-            
-            console.log('[Encryption DEBUG] Client public key length:', clientPublicKey.byteLength);
-            console.log('[Encryption DEBUG] Client public key (first 16 bytes):', 
-                Array.from(new Uint8Array(clientPublicKey).slice(0, 16))
-                    .map(b => b.toString(16).padStart(2, '0').toUpperCase())
-                    .join(' '));
-            
             const sendBuffer = new ArrayBuffer(4 + clientPublicKey.byteLength);
             const sendView = new DataView(sendBuffer);
             
             // Write length prefix (big-endian)
             sendView.setUint32(0, clientPublicKey.byteLength, false);
             
-            console.log('[Encryption DEBUG] Length prefix written:', sendView.getUint32(0, false));
-            
             // Copy public key
             new Uint8Array(sendBuffer, 4).set(new Uint8Array(clientPublicKey));
-            
-            console.log('[Encryption DEBUG] Total buffer size to send:', sendBuffer.byteLength);
             
             this._socket.send(sendBuffer);
             NitroLogger.log('[Encryption] Sent client public key (' + clientPublicKey.byteLength + ' bytes)');
